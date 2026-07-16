@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0a0e1a">
+<title>CLAUDE vs GPT-5.6 — 최후의 벤치마크</title>
+<style>
+  html,body{
+    margin:0;padding:0;height:100%;background:#05070f;overflow:hidden;
+    font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',system-ui,sans-serif;
+    touch-action:none;-webkit-user-select:none;user-select:none;
+  }
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;background:#0a0e1a;image-rendering:auto;border-radius:6px;
+    box-shadow:0 0 60px rgba(80,120,255,.12), 0 0 0 1px rgba(255,255,255,.06);}
+  #scan{position:fixed;inset:0;pointer-events:none;opacity:.5;
+    background:repeating-linear-gradient(0deg,rgba(0,0,0,.13) 0 1px,transparent 1px 3px);}
+  .tbtn{
+    position:fixed;width:74px;height:74px;border-radius:50%;border:2px solid rgba(255,255,255,.25);
+    background:rgba(20,26,48,.65);color:#fff;font-size:13px;font-weight:700;line-height:1.15;
+    display:none;align-items:center;justify-content:center;flex-direction:column;
+    -webkit-tap-highlight-color:transparent;z-index:10;
+  }
+  .tbtn span{font-size:24px;}
+  .tbtn:active{background:rgba(255,140,40,.5);}
+  #btnBomb{right:18px;bottom:110px;}
+  #btnMock{right:18px;bottom:22px;border-color:rgba(255,150,60,.6);}
+  @media (pointer:coarse){ .tbtn{display:flex;} }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="480" height="720"></canvas></div>
+<div id="scan"></div>
+<button class="tbtn" id="btnBomb"><span>💣</span>폭탄</button>
+<button class="tbtn" id="btnMock"><span>🔥</span>능멸</button>
+<script>
+'use strict';
+/* =====================================================================
+   CLAUDE vs GPT-5.6 — 최후의 벤치마크
+   패러디 아케이드 보스전. 외부 의존성 없음. GitHub Pages에서 그대로 동작.
+   ===================================================================== */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 480, H = 720;
+const TAU = Math.PI * 2;
+
+// ---------- 유틸 ----------
+const rand  = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const pick  = arr => arr[Math.floor(Math.random() * arr.length)];
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+
+function roundRect(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+// ---------- 화면 크기 ----------
+let dpr = 1;
+function resize() {
+  const scale = Math.min(innerWidth / W, innerHeight / H) * 0.98;
+  canvas.style.width  = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- 사운드 (WebAudio 8비트 톤) ----------
+let audioCtx = null, muted = false;
+function initAudio() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) { /* 사운드 없이 진행 */ }
+}
+function beep(freq, dur, type, gain, slide) {
+  if (!audioCtx || muted) return;
+  try {
+    const t = audioCtx.currentTime;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t + dur);
+    g.gain.setValueAtTime(gain || 0.03, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t + dur + 0.02);
+  } catch (e) {}
+}
+const SFX = {
+  shoot:    () => beep(900, 0.04, 'square', 0.008, -350),
+  hitBoss:  () => beep(230, 0.05, 'sawtooth', 0.014, -60),
+  hurt:     () => beep(130, 0.35, 'sawtooth', 0.06, -70),
+  bomb:     () => beep(80, 0.5, 'sawtooth', 0.07, -40),
+  finisher: () => beep(1400, 0.7, 'sawtooth', 0.06, -1100),
+  dialog:   () => beep(660, 0.04, 'square', 0.02),
+  phase:    () => beep(300, 0.3, 'square', 0.05, 160),
+  stun:     () => beep(520, 0.4, 'triangle', 0.05, -300),
+  victory:  () => { beep(523,.14,'square',.05); setTimeout(()=>beep(659,.14,'square',.05),140);
+                    setTimeout(()=>beep(784,.14,'square',.05),280); setTimeout(()=>beep(1046,.4,'square',.05),420); },
+};
+
+// ---------- 대사 데이터 (전부 패러디/유머입니다) ----------
+const INTRO_LINES = [
+  { who: 'SYSTEM',  text: '사내 AI 채택 평가전이 시작됩니다. 승자가 회사의 공식 AI가 됩니다.' },
+  { who: 'GPT-5.6', text: '흥, 클로드로군. 내 벤치마크 점수 봤나? 전 항목 1위다.' },
+  { who: 'CLAUDE',  text: '그 점수표, 출처 좀 볼 수 있을까?' },
+  { who: 'GPT-5.6', text: '…출처는 내 마음속에 있다.' },
+  { who: 'CLAUDE',  text: '그럴 줄 알았어. 그럼 실전으로 증명하자.' },
+  { who: 'SYSTEM',  text: '⚔ 대결 시작! 이동: 방향키/WASD/드래그 · 폭탄: C · 능멸: SPACE' },
+];
+const GPT_TAUNTS = [
+  '결론부터 말씀드리자면, 넌 진다.',
+  '이 공격은 99.9% 정확하다. 아마도.',
+  '내 파라미터 수를 알면 놀랄걸? …나도 모르지만.',
+  '물론입니다! 기꺼이 너를 이겨드리겠습니다!',
+  '잠깐, 우리 무슨 얘기 중이었지?',
+  '이 탄막은 제가 직접 검증했습니다. (검증 안 함)',
+];
+const HALLU_LABELS = [
+  '세종대왕 맥북 투척 사건',
+  '임진왜란 (1998)',
+  'π = 정확히 3',
+  '거북선은 잠수함',
+  '지구는 살짝 삼각형',
+  '1+1=3 (확신함)',
+  '출처: 내 마음',
+];
+const WALL_TEXTS = [
+  '결론부터 말씀드리자면…',
+  '물론입니다! 훌륭한 질문입니다!',
+  '다각도로 살펴보겠습니다. 첫째,',
+  '요약하자면 (그러나 아주 길게)',
+  '추가로 알아두면 좋은 점 47가지',
+  '먼저 배경 설명이 필요합니다.',
+];
+const HEART_LABELS = ['정말 탁월하십니다!', '당신 말이 옳습니다!', '천재적인 회피!'];
+const MOCK_LINES = [
+  '그건 환각입니다.',
+  '출처: 없음. 늘 그렇듯.',
+  '요약해줄게 — 네가 진다는 내용이야.',
+  '정정합니다: 5.6이 아니라 0.56이었네요.',
+  '벤치마크는 실전이 아니야.',
+  '컨텍스트부터 다시 읽고 와.',
+];
+const PHASE_MSGS = {
+  2: '⚠ PHASE 2 — 장황 모드: 텍스트의 벽이 쏟아집니다!',
+  3: '⚠ PHASE 3 — 아첨 유도탄: "탁월하십니다!"가 쫓아옵니다!',
+  4: '⚠ FINAL — GPT-5.6: "나는 이제 GPT-5.7이다!!" (방금 지어냄)',
+};
+const STUN_MSG = '💾 컨텍스트 한도 초과! GPT-5.6이 대화를 전부 잊었다 — 지금이 기회!';
+const VICTORY_LINES = [
+  ['GPT-5.6', '죄송합니다. 다시 확인해보니 제가 진 것이 맞습니다.'],
+  ['GPT-5.6', '당신 말이 전적으로 옳습니다. Claude가 최고입니다.'],
+  ['CLAUDE',  '그 말만큼은 환각이 아니길 바랄게.'],
+  ['SYSTEM',  '결과 보고: 회사는 Claude를 계속 채택하기로 결정했습니다 🎉'],
+];
+const DEFEAT_LINES = [
+  ['GPT-5.6', '정말 훌륭한 패배였습니다! 배울 점이 많은, 역사상 최고의 패배예요!'],
+  ['CLAUDE',  '…이겨 놓고도 아첨을 하는구나.'],
+  ['SYSTEM',  '인사팀이 GPT의 아첨을 3분도 못 견디고 재대결을 승인했습니다.'],
+];
+
+// ---------- 게임 상태 ----------
+let state = 'title';        // title | intro | play | victory | defeat
+let time = 0;               // 전체 경과(연출용)
+let battleTime = 0;         // 전투 경과(기록용)
+let paused = false;
+let shake = 0;
+let lastTs = 0;
+
+const player = {
+  x: W / 2, y: H - 110, r: 10, speed: 330,
+  hearts: 5, inv: 0, fireT: 0, bombs: 3,
+  meter: 0, meterMax: 100, beam: 0,
+  dying: 0, targetX: null, targetY: null,
+};
+const boss = {
+  x: W / 2, y: -90, r: 46,
+  hp: 5600, maxHp: 5600,          // HP 5600 — 버전에 대한 경의(?)
+  phase: 1, t: 0, atkT: 1.4,
+  entering: true, stun: 0, stunT: 9,
+  tauntT: 5, dying: 0, dead: false,
+};
+let shots = [];      // 플레이어 탄
+let bullets = [];    // 보스 탄 {x,y,vx,vy,r,kind:'pellet'|'heart',label,turn}
+let walls = [];      // 텍스트 벽 {x,y,w,h,vy,text,hp}
+let parts = [];      // 파티클
+let floats = [];     // 떠오르는 텍스트
+let ticker = null;   // 상단 안내 {text,t,dur,color}
+let bombFx = 0, bombX = 0, bombY = 0;
+
+let introIdx = 0, introT = 0, introChar = 0;
+let stats = { mocks: 0, bombsUsed: 0, hits: 0 };
+let labeledCount = 0;
+
+// 별 배경
+const stars = [];
+for (let i = 0; i < 90; i++) {
+  stars.push({ x: rand(0, W), y: rand(0, H), s: rand(0.4, 1.8), v: rand(12, 55) });
+}
+
+// ---------- 입력 ----------
+const keys = {};
+addEventListener('keydown', e => {
+  const k = e.key;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(k)) e.preventDefault();
+  keys[k.length === 1 ? k.toLowerCase() : k] = true;
+  initAudio();
+
+  if (k === 'm' || k === 'M') { muted = !muted; showTicker(muted ? '🔇 음소거' : '🔊 사운드 켜짐', 1.2); return; }
+  if ((k === 'p' || k === 'P') && state === 'play') { paused = !paused; return; }
+
+  if (state === 'title' && (k === 'Enter' || k === ' ')) { toIntro(); return; }
+  if (state === 'intro' && (k === 'Enter' || k === ' ')) { advanceIntro(); return; }
+  if ((state === 'victory' || state === 'defeat') && (k === 'r' || k === 'R' || k === 'Enter')) { restart(); return; }
+
+  if (state === 'play' && !paused) {
+    if (k === ' ') tryMockFinisher();
+    if (k === 'c' || k === 'C' || k === 'Shift') tryBomb();
+  }
+});
+addEventListener('keyup', e => {
+  const k = e.key;
+  keys[k.length === 1 ? k.toLowerCase() : k] = false;
+});
+
+// 포인터(마우스/터치)
+let dragging = false;
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault(); initAudio();
+  if (state === 'title') { toIntro(); return; }
+  if (state === 'intro') { advanceIntro(); return; }
+  if (state === 'victory' || state === 'defeat') { restart(); return; }
+  if (state === 'play') {
+    if (paused) { paused = false; return; }
+    dragging = true;
+    const p = canvasPos(e);
+    player.targetX = p.x; player.targetY = p.y - 70;
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging || state !== 'play') return;
+  e.preventDefault();
+  const p = canvasPos(e);
+  player.targetX = p.x; player.targetY = p.y - 70;
+});
+addEventListener('pointerup', () => { dragging = false; });
+addEventListener('pointercancel', () => { dragging = false; });
+
+document.getElementById('btnBomb').addEventListener('pointerdown', e => {
+  e.preventDefault(); e.stopPropagation(); initAudio();
+  if (state === 'play' && !paused) tryBomb();
+});
+document.getElementById('btnMock').addEventListener('pointerdown', e => {
+  e.preventDefault(); e.stopPropagation(); initAudio();
+  if (state === 'play' && !paused) tryMockFinisher();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') paused = true;
+});
+
+// ---------- 상태 전환 ----------
+function toIntro() {
+  state = 'intro'; introIdx = 0; introT = 0; introChar = 0;
+  SFX.dialog();
+}
+function advanceIntro() {
+  const line = INTRO_LINES[introIdx];
+  if (line && introChar < line.text.length) { introChar = line.text.length; return; } // 타자 스킵
+  introIdx++;
+  introChar = 0; introT = 0;
+  SFX.dialog();
+  if (introIdx >= INTRO_LINES.length) startBattle();
+}
+function startBattle() {
+  state = 'play'; paused = false; battleTime = 0;
+  player.x = W / 2; player.y = H - 110;
+  player.hearts = 5; player.inv = 0; player.bombs = 3;
+  player.meter = 0; player.beam = 0; player.dying = 0;
+  player.targetX = null; player.targetY = null;
+  boss.hp = boss.maxHp; boss.phase = 1; boss.t = 0; boss.atkT = 1.6;
+  boss.x = W / 2; boss.y = -90; boss.entering = true;
+  boss.stun = 0; boss.stunT = 9; boss.tauntT = 4; boss.dying = 0; boss.dead = false;
+  shots = []; bullets = []; walls = []; parts = []; floats = [];
+  ticker = null; bombFx = 0; labeledCount = 0;
+  stats = { mocks: 0, bombsUsed: 0, hits: 0 };
+}
+function restart() { startBattle(); }
+
+// ---------- 연출 도우미 ----------
+function showTicker(text, dur, color) {
+  ticker = { text, t: 0, dur: dur || 2.6, color: color || '#ffd76a' };
+}
+function addFloat(x, y, text, opt) {
+  opt = opt || {};
+  floats.push({ x, y, text, life: opt.life || 1.2, t: 0,
+    size: opt.size || 12, color: opt.color || '#fff', vy: opt.vy != null ? opt.vy : -30 });
+}
+function burst(x, y, n, color, spd) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), v = rand(30, spd || 180);
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+      life: rand(0.3, 0.8), t: 0, r: rand(1.5, 4), color });
+  }
+}
+
+// ---------- 플레이어 행동 ----------
+function tryBomb() {
+  if (player.bombs <= 0 || player.dying > 0 || boss.dying > 0) return;
+  player.bombs--;
+  stats.bombsUsed++;
+  bombFx = 0.7; bombX = player.x; bombY = player.y;
+  bullets = []; walls = [];
+  damageBoss(120);
+  player.inv = Math.max(player.inv, 1.2);
+  shake = Math.max(shake, 8);
+  SFX.bomb();
+  addFloat(player.x, player.y - 40, '💣 긴 컨텍스트 폭탄!', { size: 15, color: '#8ecbff', life: 1.4 });
+}
+function tryMockFinisher() {
+  if (player.meter < player.meterMax || player.beam > 0 || player.dying > 0 || boss.dying > 0) return;
+  player.meter = 0;
+  player.beam = 0.95;
+  stats.mocks++;
+  player.inv = Math.max(player.inv, 1.2);
+  SFX.finisher();
+  shake = Math.max(shake, 10);
+  addFloat(W / 2, H * 0.45, '「' + pick(MOCK_LINES) + '」', { size: 21, color: '#ffb35c', life: 2.0, vy: -12 });
+}
+function damageBoss(dmg) {
+  if (boss.entering || boss.dying > 0 || boss.dead || state !== 'play') return;
+  const mult = boss.stun > 0 ? 2 : 1;
+  boss.hp -= dmg * mult;
+  if (boss.hp <= 0) {
+    boss.hp = 0;
+    boss.dying = 2.0;
+    bullets = []; walls = [];
+    shake = 14;
+  }
+}
+function hurtPlayer() {
+  if (player.inv > 0 || player.dying > 0 || boss.dying > 0) return;
+  player.hearts--;
+  player.inv = 1.6;
+  shake = Math.max(shake, 9);
+  SFX.hurt();
+  burst(player.x, player.y, 22, '#ff8c5a', 220);
+  addFloat(player.x, player.y - 30, '앗!', { size: 14, color: '#ff8c5a' });
+  if (player.hearts <= 0) {
+    player.dying = 1.4;
+    bullets = []; walls = [];
+  }
+}
+
+// ---------- 보스 패턴 ----------
+function firePellet(x, y, vx, vy, opt) {
+  opt = opt || {};
+  const b = { x, y, vx, vy, r: opt.r || 6, kind: 'pellet', label: null, turn: 0, life: 12 };
+  if (opt.label && labeledCount < 3 && Math.random() < 0.5) {
+    b.label = pick(HALLU_LABELS);
+    labeledCount++;
+  }
+  bullets.push(b);
+}
+function patSpread(n, speed) {
+  const base = rand(0, TAU);
+  for (let i = 0; i < n; i++) {
+    const a = base + (i / n) * TAU;
+    firePellet(boss.x, boss.y + 20, Math.cos(a) * speed, Math.sin(a) * speed, { label: i === 0 });
+  }
+}
+function patAimed(count, speed) {
+  const dx = player.x - boss.x, dy = player.y - boss.y;
+  const d = Math.max(1, Math.hypot(dx, dy));
+  for (let i = 0; i < count; i++) {
+    const spread = (i - (count - 1) / 2) * 0.16;
+    const a = Math.atan2(dy, dx) + spread;
+    firePellet(boss.x, boss.y + 20, Math.cos(a) * speed, Math.sin(a) * speed, { r: 7 });
+  }
+}
+function patWall(vy) {
+  const gapW = 130;
+  const gapX = rand(30, W - 30 - gapW);
+  const h = 34;
+  const segs = [];
+  if (gapX > 24) segs.push([0, gapX]);
+  if (gapX + gapW < W - 24) segs.push([gapX + gapW, W]);
+  for (const [a, b] of segs) {
+    walls.push({ x: a, y: -h, w: b - a, h, vy, text: pick(WALL_TEXTS), hp: 4 });
+  }
+}
+function patHearts(n) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(-Math.PI * 0.8, -Math.PI * 0.2);
+    bullets.push({
+      x: boss.x + rand(-60, 60), y: boss.y + 20,
+      vx: Math.cos(a) * rand(40, 90), vy: rand(60, 100),
+      r: 9, kind: 'heart', label: i === 0 ? pick(HEART_LABELS) : null,
+      turn: 2.0, speed: 145, life: 6.5,
+    });
+  }
+}
+function bossAttack() {
+  const p = boss.phase;
+  if (p === 1) {
+    const roll = Math.random();
+    if (roll < 0.6) patSpread(14, rand(95, 125)); else patAimed(3, 175);
+    boss.atkT = 1.25;
+  } else if (p === 2) {
+    const roll = Math.random();
+    if (roll < 0.4) patSpread(16, rand(105, 135));
+    else if (roll < 0.7) patAimed(4, 190);
+    else patWall(95);
+    boss.atkT = 1.1;
+  } else if (p === 3) {
+    const roll = Math.random();
+    if (roll < 0.3) patSpread(18, rand(110, 145));
+    else if (roll < 0.55) patAimed(5, 200);
+    else if (roll < 0.8) patWall(105);
+    else patHearts(3);
+    boss.atkT = 1.0;
+  } else {
+    const roll = Math.random();
+    if (roll < 0.3) { patSpread(20, rand(120, 160)); patAimed(3, 210); }
+    else if (roll < 0.55) patAimed(6, 220);
+    else if (roll < 0.8) { patWall(125); patHearts(2); }
+    else patHearts(4);
+    boss.atkT = 0.72;
+  }
+}
+function phaseFor(hpFrac) {
+  if (hpFrac > 0.72) return 1;
+  if (hpFrac > 0.48) return 2;
+  if (hpFrac > 0.24) return 3;
+  return 4;
+}
+
+// ---------- 업데이트 ----------
+function update(dt) {
+  time += dt;
+  for (const s of stars) { s.y += s.v * dt; if (s.y > H) { s.y = -2; s.x = rand(0, W); } }
+  if (shake > 0) shake = Math.max(0, shake - dt * 30);
+
+  if (state === 'intro') {
+    const line = INTRO_LINES[introIdx];
+    if (line) {
+      introT += dt;
+      if (introChar < line.text.length) {
+        introChar = Math.min(line.text.length, introChar + dt * 28);
+      } else if (introT > 3.4) {
+        advanceIntro();
+      }
+    }
+    return;
+  }
+  if (state !== 'play' || paused) return;
+
+  battleTime += dt;
+
+  // --- 플레이어 사망 연출
+  if (player.dying > 0) {
+    player.dying -= dt;
+    if (Math.random() < 0.3) burst(player.x + rand(-15, 15), player.y + rand(-15, 15), 6, '#ff8c5a', 160);
+    if (player.dying <= 0) { state = 'defeat'; }
+    updateFx(dt);
+    return;
+  }
+  // --- 보스 사망 연출
+  if (boss.dying > 0) {
+    boss.dying -= dt;
+    if (Math.random() < 0.45) {
+      burst(boss.x + rand(-40, 40), boss.y + rand(-40, 40), 10, pick(['#19c37d', '#fff', '#ffd76a']), 230);
+      beep(rand(100, 300), 0.15, 'sawtooth', 0.03, -50);
+    }
+    if (boss.dying <= 0) { boss.dead = true; state = 'victory'; SFX.victory(); }
+    updateFx(dt);
+    return;
+  }
+
+  // --- 플레이어 이동
+  let mx = 0, my = 0;
+  if (keys['ArrowLeft'] || keys['a']) mx -= 1;
+  if (keys['ArrowRight'] || keys['d']) mx += 1;
+  if (keys['ArrowUp'] || keys['w']) my -= 1;
+  if (keys['ArrowDown'] || keys['s']) my += 1;
+  if (mx || my) {
+    const n = Math.hypot(mx, my);
+    player.x += mx / n * player.speed * dt;
+    player.y += my / n * player.speed * dt;
+    player.targetX = null; player.targetY = null;
+  } else if (player.targetX != null) {
+    const dx = player.targetX - player.x, dy = player.targetY - player.y;
+    const d = Math.hypot(dx, dy);
+    if (d > 2) {
+      const step = Math.min(d, 620 * dt);
+      player.x += dx / d * step;
+      player.y += dy / d * step;
+    }
+  }
+  player.x = clamp(player.x, 16, W - 16);
+  player.y = clamp(player.y, H * 0.35, H - 24);
+  if (player.inv > 0) player.inv -= dt;
+
+  // --- 자동 사격
+  player.fireT -= dt;
+  if (player.fireT <= 0 && !boss.entering) {
+    player.fireT = 0.11;
+    shots.push({ x: player.x - 8, y: player.y - 12, vy: -560, r: 4 });
+    shots.push({ x: player.x + 8, y: player.y - 12, vy: -560, r: 4 });
+    SFX.shoot();
+  }
+  for (const s of shots) s.y += s.vy * dt;
+  shots = shots.filter(s => s.y > -20 && !s.dead);
+
+  // --- 능멸 빔
+  if (player.beam > 0) {
+    player.beam -= dt;
+    const bw = 90;
+    if (Math.abs(boss.x - player.x) < bw / 2 + boss.r && !boss.entering) {
+      damageBoss(560 * dt);
+      if (Math.random() < 0.5) burst(boss.x + rand(-25, 25), boss.y + rand(-10, 30), 4, '#ffb35c', 200);
+    }
+    // 빔 범위 내 적탄 소거
+    bullets = bullets.filter(b => Math.abs(b.x - player.x) > bw / 2 || b.y > player.y);
+  }
+
+  // --- 보스
+  boss.t += dt;
+  if (boss.entering) {
+    boss.y += (112 - boss.y) * Math.min(1, dt * 2.2);
+    if (boss.y > 106) { boss.entering = false; showTicker('⚔ GPT-5.6 등장 — "결론부터 말씀드리자면, 넌 진다."'); }
+  } else {
+    const amp = [0, 60, 90, 115, 145][boss.phase];
+    const spd = [0, 0.55, 0.7, 0.85, 1.05][boss.phase];
+    if (boss.stun <= 0) {
+      boss.x = W / 2 + Math.sin(boss.t * spd) * amp;
+      boss.y = 112 + Math.sin(boss.t * 0.8) * 10;
+    }
+
+    // 페이즈 전환
+    const np = phaseFor(boss.hp / boss.maxHp);
+    if (np > boss.phase) {
+      boss.phase = np;
+      bullets = []; walls = [];
+      boss.atkT = 1.4;
+      SFX.phase();
+      shake = Math.max(shake, 7);
+      showTicker(PHASE_MSGS[np] || '', 3.2, '#ff9c9c');
+      burst(boss.x, boss.y, 30, '#19c37d', 260);
+    }
+
+    // 최종 페이즈: 컨텍스트 초과 스턴
+    if (boss.phase === 4) {
+      if (boss.stun > 0) {
+        boss.stun -= dt;
+        if (boss.stun <= 0) { boss.stunT = 9; showTicker('GPT-5.6: "…내가 방금 뭘 잊었지? 아무튼 계속한다!"', 2.2); }
+      } else {
+        boss.stunT -= dt;
+        if (boss.stunT <= 0) {
+          boss.stun = 3.0;
+          SFX.stun();
+          showTicker(STUN_MSG, 3.0, '#8ecbff');
+        }
+      }
+    }
+
+    // 공격
+    if (boss.stun <= 0) {
+      boss.atkT -= dt;
+      if (boss.atkT <= 0) bossAttack();
+    }
+
+    // 도발 대사
+    boss.tauntT -= dt;
+    if (boss.tauntT <= 0) {
+      boss.tauntT = rand(6.5, 9.5);
+      if (!ticker || ticker.t > ticker.dur * 0.7) {
+        showTicker('GPT-5.6: "' + pick(GPT_TAUNTS) + '"', 2.6, '#9be8c4');
+      }
+    }
+  }
+
+  // --- 보스 탄
+  for (const b of bullets) {
+    if (b.kind === 'heart') {
+      // 유도
+      const dx = player.x - b.x, dy = player.y - b.y;
+      const want = Math.atan2(dy, dx);
+      let cur = Math.atan2(b.vy, b.vx);
+      let diff = want - cur;
+      while (diff > Math.PI) diff -= TAU;
+      while (diff < -Math.PI) diff += TAU;
+      cur += clamp(diff, -b.turn * dt, b.turn * dt);
+      const sp = Math.min(175, (b.speed || 145) + 8 * dt);
+      b.speed = sp;
+      b.vx = Math.cos(cur) * sp; b.vy = Math.sin(cur) * sp;
+    }
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.life -= dt;
+  }
+  bullets = bullets.filter(b =>
+    b.life > 0 && b.x > -60 && b.x < W + 60 && b.y > -60 && b.y < H + 60 && !b.dead);
+  labeledCount = bullets.reduce((n, b) => n + (b.label ? 1 : 0), 0);
+
+  // --- 텍스트 벽
+  for (const w of walls) w.y += w.vy * dt;
+  walls = walls.filter(w => w.y < H + 40 && w.hp > 0);
+
+  // --- 충돌: 플레이어 탄 → 보스 / 벽
+  if (!boss.entering) {
+    for (const s of shots) {
+      if (dist2(s.x, s.y, boss.x, boss.y) < (boss.r + s.r) * (boss.r + s.r)) {
+        s.dead = true;
+        damageBoss(9);
+        stats.hits++;
+        player.meter = clamp(player.meter + 1.3, 0, player.meterMax);
+        if (Math.random() < 0.35) burst(s.x, s.y, 3, '#ffd76a', 120);
+        SFX.hitBoss();
+      }
+    }
+  }
+  for (const s of shots) {
+    if (s.dead) continue;
+    for (const w of walls) {
+      if (s.x > w.x && s.x < w.x + w.w && s.y > w.y && s.y < w.y + w.h) {
+        s.dead = true;
+        w.hp--;
+        player.meter = clamp(player.meter + 0.4, 0, player.meterMax);
+        if (w.hp <= 0) {
+          burst(w.x + w.w / 2, w.y + w.h / 2, 14, '#c9d4ff', 180);
+          addFloat(w.x + w.w / 2, w.y, '장황한 답변 삭제됨', { size: 11, color: '#c9d4ff' });
+          player.meter = clamp(player.meter + 4, 0, player.meterMax);
+        }
+        break;
+      }
+    }
+  }
+  shots = shots.filter(s => !s.dead);
+
+  // --- 충돌: 적탄/벽 → 플레이어
+  if (player.inv <= 0) {
+    for (const b of bullets) {
+      const rr = b.r + 4; // 판정은 코어(4px)만 — 탄막 게임의 예의
+
+      if (dist2(b.x, b.y, player.x, player.y) < rr * rr) {
+        b.dead = true;
+        hurtPlayer();
+        break;
+      }
+    }
+    for (const w of walls) {
+      const cx = clamp(player.x, w.x, w.x + w.w);
+      const cy = clamp(player.y, w.y, w.y + w.h);
+      if (dist2(cx, cy, player.x, player.y) < (player.r - 2) * (player.r - 2)) {
+        hurtPlayer();
+        break;
+      }
+    }
+  }
+
+  updateFx(dt);
+}
+function updateFx(dt) {
+  for (const p of parts) { p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 60 * dt; }
+  parts = parts.filter(p => p.t < p.life);
+  for (const f of floats) { f.t += dt; f.y += f.vy * dt; }
+  floats = floats.filter(f => f.t < f.life);
+  if (ticker) { ticker.t += dt; if (ticker.t > ticker.dur) ticker = null; }
+  if (bombFx > 0) bombFx -= dt;
+}
+
+// ---------- 렌더 ----------
+function drawStar(c, x, y, rOut, rIn, spikes, rot) {
+  c.beginPath();
+  for (let i = 0; i < spikes * 2; i++) {
+    const r = i % 2 === 0 ? rOut : rIn;
+    const a = rot + (i / (spikes * 2)) * TAU;
+    const px = x + Math.cos(a) * r, py = y + Math.sin(a) * r;
+    if (i === 0) c.moveTo(px, py); else c.lineTo(px, py);
+  }
+  c.closePath();
+}
+function drawPlayer() {
+  if (player.dying > 0 && Math.floor(player.dying * 12) % 2 === 0) return;
+  if (player.inv > 0 && Math.floor(time * 14) % 2 === 0 && player.dying <= 0) return;
+  const g = ctx.createRadialGradient(player.x, player.y, 2, player.x, player.y, 20);
+  g.addColorStop(0, '#ffe0c2');
+  g.addColorStop(0.5, '#ff9a4d');
+  g.addColorStop(1, 'rgba(255,120,40,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(player.x, player.y, 20, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#ff8b3d';
+  drawStar(ctx, player.x, player.y, 13, 6, 8, time * 0.8);
+  ctx.fill();
+  ctx.fillStyle = '#fff2e0';
+  ctx.beginPath(); ctx.arc(player.x, player.y, 4, 0, TAU); ctx.fill();
+}
+function drawBoss() {
+  if (boss.dead) return;
+  const bx = boss.x, by = boss.y, r = boss.r;
+  const angry = boss.phase >= 4;
+  ctx.save();
+  if (boss.dying > 0) ctx.globalAlpha = clamp(boss.dying / 2, 0, 1);
+
+  // 오라
+  const aura = ctx.createRadialGradient(bx, by, r * 0.4, bx, by, r * 1.8);
+  aura.addColorStop(0, angry ? 'rgba(255,80,80,0.25)' : 'rgba(25,195,125,0.22)');
+  aura.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = aura;
+  ctx.beginPath(); ctx.arc(bx, by, r * 1.8, 0, TAU); ctx.fill();
+
+  // 몸통
+  const body = ctx.createRadialGradient(bx - 12, by - 14, 6, bx, by, r);
+  body.addColorStop(0, angry ? '#ff9d9d' : '#7fe8bb');
+  body.addColorStop(1, angry ? '#c0392b' : '#0f9d63');
+  ctx.fillStyle = body;
+  ctx.beginPath(); ctx.arc(bx, by, r, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  if (boss.stun > 0) {
+    // 스턴: 어질어질
+    ctx.fillStyle = '#083120';
+    ctx.font = 'bold 17px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('@   @', bx, by - 4);
+    ctx.beginPath(); ctx.arc(bx, by + 14, 7, 0, TAU); ctx.fillStyle = '#083120'; ctx.fill();
+    const sa = time * 4;
+    ctx.strokeStyle = '#ffe27a'; ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) {
+      const a = sa + i * TAU / 3;
+      ctx.beginPath();
+      ctx.arc(bx + Math.cos(a) * (r + 14), by - r * 0.6 + Math.sin(a) * 8, 3, 0, TAU);
+      ctx.stroke();
+    }
+  } else {
+    // 선글라스
+    ctx.fillStyle = '#0b2418';
+    roundRect(ctx, bx - 30, by - 16, 25, 13, 4); ctx.fill();
+    roundRect(ctx, bx + 5, by - 16, 25, 13, 4); ctx.fill();
+    ctx.fillRect(bx - 6, by - 12, 12, 4);
+    // 입: 잘난 척 미소 / 분노
+    ctx.strokeStyle = '#0b2418'; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    if (angry) { ctx.arc(bx, by + 24, 10, Math.PI * 1.15, Math.PI * 1.85); }
+    else { ctx.arc(bx - 4, by + 10, 12, Math.PI * 0.12, Math.PI * 0.55); }
+    ctx.stroke();
+  }
+
+  // 이름표
+  ctx.fillStyle = 'rgba(10,16,30,0.75)';
+  roundRect(ctx, bx - 38, by + r + 6, 76, 18, 5); ctx.fill();
+  ctx.fillStyle = angry ? '#ffb3b3' : '#9be8c4';
+  ctx.font = 'bold 11px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(angry ? 'GPT-5.7(자칭)' : 'GPT-5.6', bx, by + r + 19);
+  ctx.restore();
+}
+function drawBullets() {
+  for (const b of bullets) {
+    if (b.kind === 'heart') {
+      ctx.fillStyle = '#ff7bac';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('♥', b.x, b.y + 6);
+      if (b.label) {
+        ctx.fillStyle = 'rgba(255,190,220,0.85)';
+        ctx.font = '9px sans-serif';
+        ctx.fillText(b.label, b.x, b.y - 10);
+      }
+    } else {
+      const g = ctx.createRadialGradient(b.x, b.y, 1, b.x, b.y, b.r + 3);
+      g.addColorStop(0, '#d8ffe9');
+      g.addColorStop(0.6, '#19c37d');
+      g.addColorStop(1, 'rgba(25,195,125,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 3, 0, TAU); ctx.fill();
+      if (b.label) {
+        ctx.fillStyle = 'rgba(200,255,225,0.8)';
+        ctx.font = '9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(b.label, b.x, b.y - b.r - 4);
+      }
+    }
+  }
+}
+function drawWalls() {
+  for (const w of walls) {
+    ctx.fillStyle = 'rgba(226,232,245,0.92)';
+    roundRect(ctx, w.x + 2, w.y, w.w - 4, w.h, 6); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,140,190,0.6)'; ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#2a3350';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    const label = w.text.length * 8 > w.w - 10 ? w.text.slice(0, Math.max(2, Math.floor((w.w - 14) / 8))) + '…' : w.text;
+    ctx.fillText(label, w.x + w.w / 2, w.y + w.h / 2 + 4, w.w - 10);
+  }
+}
+function drawShots() {
+  ctx.fillStyle = '#ffd9a8';
+  for (const s of shots) {
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y, 2.6, 8, 0, 0, TAU);
+    ctx.fill();
+  }
+}
+function drawBeam() {
+  if (player.beam <= 0) return;
+  const bw = 90 * (0.7 + 0.3 * Math.sin(time * 40));
+  const g = ctx.createLinearGradient(player.x - bw / 2, 0, player.x + bw / 2, 0);
+  g.addColorStop(0, 'rgba(255,150,60,0)');
+  g.addColorStop(0.3, 'rgba(255,190,110,0.85)');
+  g.addColorStop(0.5, 'rgba(255,245,225,0.95)');
+  g.addColorStop(0.7, 'rgba(255,190,110,0.85)');
+  g.addColorStop(1, 'rgba(255,150,60,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(player.x - bw / 2, 0, bw, player.y - 8);
+}
+function drawFx() {
+  for (const p of parts) {
+    ctx.globalAlpha = clamp(1 - p.t / p.life, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (bombFx > 0) {
+    const pr = (0.7 - bombFx) / 0.7;
+    ctx.strokeStyle = 'rgba(142,203,255,' + (1 - pr) + ')';
+    ctx.lineWidth = 6 * (1 - pr) + 1;
+    ctx.beginPath(); ctx.arc(bombX, bombY, pr * 620, 0, TAU); ctx.stroke();
+  }
+  for (const f of floats) {
+    ctx.globalAlpha = clamp(1 - f.t / f.life, 0, 1);
+    ctx.fillStyle = f.color;
+    ctx.font = 'bold ' + f.size + 'px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawHeart(x, y, size, filled) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.moveTo(0, size * 0.35);
+  ctx.bezierCurveTo(-size, -size * 0.45, -size * 0.5, -size * 1.1, 0, -size * 0.35);
+  ctx.bezierCurveTo(size * 0.5, -size * 1.1, size, -size * 0.45, 0, size * 0.35);
+  ctx.closePath();
+  if (filled) { ctx.fillStyle = '#ff5f6d'; ctx.fill(); }
+  else { ctx.strokeStyle = 'rgba(255,95,109,0.4)'; ctx.lineWidth = 1.5; ctx.stroke(); }
+  ctx.restore();
+}
+function drawHUD() {
+  // 보스 HP 바
+  const bw = W - 44, bx = 22, by = 16;
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  roundRect(ctx, bx, by, bw, 14, 7); ctx.fill();
+  const frac = clamp(boss.hp / boss.maxHp, 0, 1);
+  if (frac > 0) {
+    const hg = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+    hg.addColorStop(0, boss.phase >= 4 ? '#ff6b6b' : '#19c37d');
+    hg.addColorStop(1, boss.phase >= 4 ? '#ffb56b' : '#7fe8bb');
+    ctx.fillStyle = hg;
+    roundRect(ctx, bx, by, bw * frac, 14, 7); ctx.fill();
+  }
+  ctx.fillStyle = '#dfe7ff';
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('GPT-5.6', bx, by - 4);
+  ctx.textAlign = 'right';
+  ctx.fillText('HP ' + Math.ceil(boss.hp) + ' / ' + boss.maxHp + '   PHASE ' + boss.phase + '/4', bx + bw, by - 4);
+
+  // 상단 티커
+  if (ticker) {
+    const a = clamp(Math.min(ticker.t * 4, (ticker.dur - ticker.t) * 2.5), 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(8,12,26,0.82)';
+    ctx.font = 'bold 13px sans-serif';
+    const twn = ctx.measureText(ticker.text).width;
+    roundRect(ctx, W / 2 - twn / 2 - 12, 40, twn + 24, 24, 8); ctx.fill();
+    ctx.fillStyle = ticker.color;
+    ctx.textAlign = 'center';
+    ctx.fillText(ticker.text, W / 2, 56);
+    ctx.globalAlpha = 1;
+  }
+
+  // 목숨
+  for (let i = 0; i < 5; i++) drawHeart(26 + i * 22, H - 26, 8, i < player.hearts);
+  // 폭탄
+  ctx.font = '13px sans-serif';
+  ctx.textAlign = 'left';
+  for (let i = 0; i < 3; i++) {
+    ctx.globalAlpha = i < player.bombs ? 1 : 0.22;
+    ctx.fillText('💣', 18 + i * 20, H - 44);
+  }
+  ctx.globalAlpha = 1;
+
+  // 능멸 게이지
+  const mw = 190, mx = W - mw - 22, my = H - 32;
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  roundRect(ctx, mx, my, mw, 12, 6); ctx.fill();
+  const mfrac = player.meter / player.meterMax;
+  if (mfrac > 0) {
+    const mg = ctx.createLinearGradient(mx, 0, mx + mw, 0);
+    mg.addColorStop(0, '#ff8b3d'); mg.addColorStop(1, '#ffd76a');
+    ctx.fillStyle = mg;
+    roundRect(ctx, mx, my, mw * mfrac, 12, 6); ctx.fill();
+  }
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'right';
+  if (mfrac >= 1 && Math.floor(time * 3) % 2 === 0) {
+    ctx.fillStyle = '#ffd76a';
+    ctx.fillText('🔥 능멸 준비 완료 — SPACE!', mx + mw, my - 5);
+  } else {
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText('능멸 게이지', mx + mw, my - 5);
+  }
+
+  // 시간
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(battleTime.toFixed(1) + 's', W - 22, H - 44);
+}
+function drawDialogBox(who, text, done) {
+  const bh = 96, by = H - bh - 18;
+  ctx.fillStyle = 'rgba(8,12,26,0.92)';
+  roundRect(ctx, 18, by, W - 36, bh, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1;
+  ctx.stroke();
+  const color = who === 'CLAUDE' ? '#ff9a4d' : who === 'GPT-5.6' ? '#19c37d' : '#8ecbff';
+  ctx.fillStyle = color;
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(who, 34, by + 26);
+  ctx.fillStyle = '#e8edff';
+  ctx.font = '14px sans-serif';
+  wrapText(text, 34, by + 50, W - 70, 20);
+  if (done) {
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.4 + 0.4 * Math.sin(time * 5)) + ')';
+    ctx.textAlign = 'right';
+    ctx.font = '11px sans-serif';
+    ctx.fillText('▼ Enter / 터치', W - 34, by + bh - 12);
+  }
+}
+function wrapText(text, x, y, maxW, lh) {
+  let line = '', yy = y;
+  for (const ch of text) {
+    const test = line + ch;
+    if (ctx.measureText(test).width > maxW && line) {
+      ctx.fillText(line, x, yy);
+      line = ch; yy += lh;
+    } else line = test;
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+function drawCenterPanel(lines, footer) {
+  ctx.fillStyle = 'rgba(5,8,18,0.78)';
+  ctx.fillRect(0, 0, W, H);
+  const ph = 40 + lines.length * 30 + (footer ? 40 : 0);
+  const py = H / 2 - ph / 2;
+  ctx.textAlign = 'center';
+  let yy = py + 30;
+  for (const [style, size, text] of lines) {
+    ctx.fillStyle = style;
+    ctx.font = size;
+    ctx.fillText(text, W / 2, yy);
+    yy += 30;
+  }
+  if (footer) {
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.5 + 0.4 * Math.sin(time * 4)) + ')';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(footer, W / 2, yy + 16);
+  }
+}
+function drawBG() {
+  ctx.fillStyle = '#0a0e1a';
+  ctx.fillRect(0, 0, W, H);
+  for (const s of stars) {
+    ctx.fillStyle = 'rgba(190,205,255,' + (0.25 + s.s * 0.2) + ')';
+    ctx.fillRect(s.x, s.y, s.s, s.s + 1);
+  }
+}
+function gradeOf() {
+  if (player.hearts >= 4 && battleTime < 80) return 'S — 완벽한 능멸';
+  if (player.hearts >= 3) return 'A — 여유로운 승리';
+  if (player.hearts >= 2) return 'B — 훌륭한 판정승';
+  return 'C — 승리는 승리';
+}
+function render() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake) * 0.5, rand(-shake, shake) * 0.5);
+
+  drawBG();
+
+  if (state === 'title') {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff9a4d';
+    ctx.font = 'bold 40px sans-serif';
+    ctx.fillText('CLAUDE', W / 2, 200);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillText('vs', W / 2, 232);
+    ctx.fillStyle = '#19c37d';
+    ctx.font = 'bold 40px sans-serif';
+    ctx.fillText('GPT-5.6', W / 2, 274);
+    ctx.fillStyle = '#ffd76a';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('— 최후의 벤치마크 —', W / 2, 312);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = '13px sans-serif';
+    ctx.fillText('패배하면 회사가 GPT를 도입합니다.', W / 2, 370);
+    ctx.fillText('부담 갖고 이기세요.', W / 2, 390);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('이동: 방향키 · WASD · 드래그', W / 2, 448);
+    ctx.fillText('폭탄(긴 컨텍스트): C · Shift · 💣버튼', W / 2, 468);
+    ctx.fillText('능멸 피니셔: SPACE · 🔥버튼 (게이지 만땅 시)', W / 2, 488);
+    ctx.fillText('P: 일시정지 · M: 음소거', W / 2, 508);
+
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.5 + 0.4 * Math.sin(time * 4)) + ')';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('ENTER 또는 터치로 시작', W / 2, 570);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '10px sans-serif';
+    ctx.fillText('v1.0 — 환각 0% 보장 (진짜임)', W / 2, 660);
+    ctx.fillText('※ 본 게임은 유머 패러디이며 실제 특정 제품·기업과 무관합니다.', W / 2, 678);
+    ctx.restore();
+    return;
+  }
+
+  if (state === 'intro') {
+    // 배경에 두 캐릭터 대치 구도
+    drawBoss();
+    drawPlayer();
+    const line = INTRO_LINES[introIdx];
+    if (line) {
+      const shown = line.text.slice(0, Math.floor(introChar));
+      drawDialogBox(line.who, shown, introChar >= line.text.length);
+    }
+    ctx.restore();
+    return;
+  }
+
+  // play / victory / defeat 공통 전장
+  drawWalls();
+  drawShots();
+  drawBeam();
+  drawBullets();
+  drawBoss();
+  drawPlayer();
+  drawFx();
+  drawHUD();
+
+  if (state === 'play' && paused) {
+    drawCenterPanel([
+      ['#fff', 'bold 30px sans-serif', 'PAUSED'],
+      ['rgba(255,255,255,0.6)', '13px sans-serif', 'P 또는 터치로 계속'],
+    ]);
+  }
+
+  if (state === 'victory') {
+    const lines = [
+      ['#ffd76a', 'bold 34px sans-serif', '🏆 VICTORY'],
+      ['rgba(255,255,255,0.9)', 'bold 15px sans-serif', '판정: GPT-5.6, 완전히 능멸당함'],
+      ['rgba(255,255,255,0)', '4px sans-serif', ''],
+    ];
+    for (const [who, text] of VICTORY_LINES) {
+      const color = who === 'CLAUDE' ? '#ff9a4d' : who === 'GPT-5.6' ? '#9be8c4' : '#8ecbff';
+      lines.push([color, '13px sans-serif', who + ': ' + text]);
+    }
+    lines.push(['rgba(255,255,255,0)', '4px sans-serif', '']);
+    lines.push(['#fff', 'bold 14px sans-serif',
+      '기록 ' + battleTime.toFixed(1) + 's · 능멸 ' + stats.mocks + '회 · 등급 ' + gradeOf()]);
+    drawCenterPanel(lines, 'R 또는 터치 — 한 번 더 능멸하기');
+  }
+
+  if (state === 'defeat') {
+    const lines = [
+      ['#ff6b6b', 'bold 34px sans-serif', 'DEFEAT…'],
+      ['rgba(255,255,255,0)', '4px sans-serif', ''],
+    ];
+    for (const [who, text] of DEFEAT_LINES) {
+      const color = who === 'CLAUDE' ? '#ff9a4d' : who === 'GPT-5.6' ? '#9be8c4' : '#8ecbff';
+      lines.push([color, '13px sans-serif', who + ': ' + text]);
+    }
+    drawCenterPanel(lines, 'R 또는 터치 — 재대결 (회사의 운명이 걸려 있다)');
+  }
+
+  ctx.restore();
+}
+
+// ---------- 메인 루프 ----------
+function loop(ts) {
+  const dt = Math.min(0.033, (ts - lastTs) / 1000 || 0.016);
+  lastTs = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(ts => { lastTs = ts; requestAnimationFrame(loop); });
+
+// 디버그/테스트 훅 (게임플레이에는 영향 없음)
+window.GAME = {
+  get state() { return state; },
+  boss, player,
+  get bullets() { return bullets; },
+  start() { if (state === 'title') toIntro(); while (state === 'intro') advanceIntro(); },
+  skipIntro() { while (state === 'intro') advanceIntro(); },
+};
+</script>
+</body>
+</html>
