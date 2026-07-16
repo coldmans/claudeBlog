@@ -1165,6 +1165,7 @@ window.GAME = {
   get state() { return state; },
   boss, player,
   get bullets() { return bullets; },
+  get walls() { return walls; },
   start() { if (state === 'title') toIntro(); while (state === 'intro') advanceIntro(); },
   skipIntro() { while (state === 'intro') advanceIntro(); },
 };
